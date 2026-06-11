@@ -100,6 +100,11 @@ pub struct MessageStream {
     /// Whether the stream has ended (one-way flag: false → true)
     ended: Arc<AtomicBool>,
 
+    /// Notification primitive: background task fires this after setting
+    /// `ended = true` so that a parked consumer (whose broadcast receiver
+    /// returned Pending) gets woken up and can observe the flag.
+    ended_notify: Arc<tokio::sync::Notify>,
+
     /// Whether an error occurred (one-way flag: false → true)
     errored: Arc<AtomicBool>,
 
@@ -132,12 +137,14 @@ impl MessageStream {
         let current_message = Arc::new(RwLock::new(None));
         let event_handlers = Arc::new(Mutex::new(HashMap::new()));
         let ended = Arc::new(AtomicBool::new(false));
+        let ended_notify = Arc::new(tokio::sync::Notify::new());
         let errored = Arc::new(AtomicBool::new(false));
         let aborted = Arc::new(AtomicBool::new(false));
 
         let cm = current_message.clone();
         let handlers = event_handlers.clone();
         let end = ended.clone();
+        let end_notify = ended_notify.clone();
         let tx = event_sender.clone();
 
         tokio::spawn(async move {
@@ -156,6 +163,7 @@ impl MessageStream {
                 }),
             );
             end.store(true, Ordering::Release);
+            end_notify.notify_one();
         });
 
         Self {
@@ -166,6 +174,7 @@ impl MessageStream {
             completion_sender: None,
             completion_receiver,
             ended,
+            ended_notify,
             errored,
             aborted,
             request_id: None,
@@ -235,6 +244,7 @@ impl MessageStream {
         let current_message = Arc::new(RwLock::new(None));
         let event_handlers = Arc::new(Mutex::new(HashMap::new()));
         let ended = Arc::new(AtomicBool::new(false));
+        let ended_notify = Arc::new(tokio::sync::Notify::new());
         let errored = Arc::new(AtomicBool::new(false));
         let aborted = Arc::new(AtomicBool::new(false));
         let request_id = http_stream.request_id().map(|s| s.to_string());
@@ -248,6 +258,7 @@ impl MessageStream {
         let current_message_bg = current_message.clone();
         let event_handlers_bg = event_handlers.clone();
         let ended_bg = ended.clone();
+        let ended_notify_bg = ended_notify.clone();
         let errored_bg = errored.clone();
         let aborted_bg = aborted.clone();
         let event_sender_bg = event_sender.clone();
@@ -336,6 +347,7 @@ impl MessageStream {
                             // 4. Terminal event?
                             if matches!(event, crate::types::MessageStreamEvent::MessageStop) {
                                 ended_bg.store(true, Ordering::Release);
+                                ended_notify_bg.notify_one();
                                 let result = final_message.clone().ok_or_else(|| {
                                     crate::types::AnthropicError::StreamError(
                                         "Stream ended without message".to_string(),
@@ -394,6 +406,7 @@ impl MessageStream {
                         }
                         Ok(None) => {
                             ended_bg.store(true, Ordering::Release);
+                            ended_notify_bg.notify_one();
                             break 'outer;
                         }
                     }
@@ -434,6 +447,7 @@ impl MessageStream {
                 });
             }
             ended_bg.store(true, Ordering::Release);
+            ended_notify_bg.notify_one();
         });
         *bg_handle_clone.lock().unwrap() = Some(background_handle);
 
@@ -445,6 +459,7 @@ impl MessageStream {
             completion_sender: None, // Already consumed by the task
             completion_receiver,
             ended,
+            ended_notify,
             errored,
             aborted,
             request_id,
@@ -907,11 +922,14 @@ impl Stream for MessageStream {
 
         let mut this = self.project();
 
-        let stream_ended = this.ended.load(Ordering::Acquire);
-
         // Loop so that lagged events can be skipped without
         // returning a fatal error to the consumer.
         loop {
+            // Re-check on every iteration so that a notify that
+            // arrives between a Lagged skip and the next poll is not
+            // missed.
+            let stream_ended = this.ended.load(Ordering::Acquire);
+
             match FuturesStream::poll_next(this.event_stream.as_mut(), cx) {
                 std::task::Poll::Ready(Some(Ok(event))) => {
                     // Got a real event -- always return it regardless
@@ -938,8 +956,28 @@ impl Stream for MessageStream {
                         // the terminal state.
                         return std::task::Poll::Ready(None);
                     }
-                    // Stream not ended yet -- register waker and wait.
-                    return std::task::Poll::Pending;
+                    // Stream not ended yet.  The broadcast receiver's
+                    // waker is already registered (inside BroadcastStream
+                    // poll_next), but the sender is kept alive by this
+                    // struct so it will never emit Ready(None).  We also
+                    // poll the ended_notify so the background task can
+                    // wake us when it finishes — closing the race where
+                    // the consumer parks just before ended is set.
+                    let mut notified = std::pin::pin!(this.ended_notify.notified());
+                    match notified.as_mut().poll(cx) {
+                        std::task::Poll::Ready(()) => {
+                            // Notify was fired — background task done.
+                            if this.ended.load(Ordering::Acquire) {
+                                return std::task::Poll::Ready(None);
+                            }
+                            // Spurious or not-yet-visible; return
+                            // Pending and let the next wake-up retry.
+                            return std::task::Poll::Pending;
+                        }
+                        std::task::Poll::Pending => {
+                            return std::task::Poll::Pending;
+                        }
+                    }
                 }
             }
         }
